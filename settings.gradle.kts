@@ -6,7 +6,7 @@ pluginManagement {
     }
 }
 
-dependencyResolution {
+dependencyResolutionManagement {
     repositories {
         google()
         mavenCentral()
@@ -14,4 +14,3 @@ dependencyResolution {
 }
 
 rootProject.name = "appfiliate-android-sdk"
-include(":appfiliate")

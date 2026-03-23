@@ -1,10 +1,14 @@
 # Appfiliate Android SDK
 
-Lightweight install attribution for mobile app affiliate marketing.
+Lightweight install attribution for mobile app affiliate marketing. Zero-config fingerprint matching with support for Google Install Referrer for deterministic attribution.
+
+- Under 200KB, single dependency (Install Referrer)
+- No GAID/AAID required, no special permissions
+- One-line install tracking, works on first launch
 
 ## Installation
 
-Add JitPack repository to your `settings.gradle.kts`:
+### 1. Add JitPack to your `settings.gradle.kts`
 
 ```kotlin
 dependencyResolutionManagement {
@@ -16,73 +20,73 @@ dependencyResolutionManagement {
 }
 ```
 
-Add the dependency to your app's `build.gradle.kts`:
+### 2. Add the dependency to your app's `build.gradle.kts`
 
 ```kotlin
 dependencies {
-    implementation("com.github.yourusername:appfiliate-android-sdk:1.0.0")
+    implementation("com.github.appfiliate:appfiliate-android-sdk:1.0.0")
 }
 ```
 
 ## Quick Start
 
-**Three lines of code.** Add to your Application class or main Activity:
+### Configure and track installs
+
+In your `Application.onCreate()` or main `Activity.onCreate()`:
 
 ```kotlin
 import com.appfiliate.sdk.Appfiliate
 
-class MyApp : Application() {
-    override fun onCreate() {
-        super.onCreate()
-        Appfiliate.configure(this, appId = "app_xxx", apiKey = "key_xxx")
-        Appfiliate.trackInstall(this)
-    }
+// Configure with your credentials from app.appfiliate.io
+Appfiliate.configure(this, appId = "APP_ID_HERE", apiKey = "API_KEY_HERE")
+
+// Track the install (safe to call every launch — only runs once)
+Appfiliate.trackInstall(this) { result ->
+    Log.d("Appfiliate", "Attributed: ${result.matched}, method: ${result.method}")
 }
 ```
 
-That's it. The SDK automatically:
-- Reads the Google Play Install Referrer (deterministic attribution)
-- Falls back to fingerprint matching if referrer is unavailable
-- Caches the result locally
+### Track purchases
 
-## Track Purchases
+After a successful in-app purchase:
 
 ```kotlin
 Appfiliate.trackPurchase(
     context = this,
-    productId = "premium_monthly",
+    productId = purchase.products.first(),
     revenue = 9.99,
     currency = "USD",
-    transactionId = "GPA.1234-5678"
+    transactionId = purchase.orderId
 )
 ```
 
-## Check Attribution
+### Link a user ID (optional)
+
+For server-side integrations (e.g., RevenueCat webhooks):
 
 ```kotlin
-if (Appfiliate.isAttributed(this)) {
-    val id = Appfiliate.getAttributionId(this)
-    Log.d("Appfiliate", "Attributed! ID: $id")
-}
+Appfiliate.setUserId(this, userId = Purchases.sharedInstance.appUserID)
 ```
 
-## How It Works (Android)
+### Check attribution status
 
-Android has **deterministic attribution** via the Google Play Install Referrer API:
+```kotlin
+val attributed = Appfiliate.isAttributed(context)
+val id = Appfiliate.attributionId(context)
+```
 
-1. Creator shares a tracking link
-2. User clicks → redirected to Play Store with `&referrer=af_click_id%3Dabc123`
-3. Google stores the referrer server-side
-4. User installs and opens the app
-5. SDK reads the Install Referrer → extracts the exact click ID
-6. 100% accurate match (when referrer is present)
+## How It Works
 
-Fallback fingerprint matching (IP + device signals) handles cases where the referrer is lost.
+1. On first launch, the SDK collects device signals (model, screen size, timezone, language) and the Google Play Install Referrer
+2. These signals are sent to the Appfiliate attribution API
+3. The API matches the install to a tracking link click using deterministic referrer matching or fingerprint matching
+4. The result is cached locally — `trackInstall()` only fires once per install
+5. Subsequent purchases are linked to the attribution via `trackPurchase()`
 
 ## Requirements
 
-- Android 5.0+ (API 21)
-- Google Play Services
+- Android API 21+ (Android 5.0)
+- Internet permission (added automatically by the SDK manifest)
 
 ## License
 

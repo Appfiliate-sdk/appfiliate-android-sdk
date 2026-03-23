@@ -1,8 +1,11 @@
+// Appfiliate Android SDK
+// Lightweight install attribution for mobile app affiliate marketing.
+// https://appfiliate.io
+
 package com.appfiliate.sdk
 
 import android.content.Context
 import android.os.Build
-import android.util.DisplayMetrics
 import android.util.Log
 import com.android.installreferrer.api.InstallReferrerClient
 import com.android.installreferrer.api.InstallReferrerStateListener
@@ -11,11 +14,22 @@ import org.json.JSONObject
 import java.io.OutputStreamWriter
 import java.net.HttpURLConnection
 import java.net.URL
+import java.text.SimpleDateFormat
+import java.util.Date
 import java.util.Locale
 import java.util.TimeZone
 import java.util.concurrent.Executors
 
-public object Appfiliate {
+/**
+ * Appfiliate — lightweight install attribution for mobile app affiliate marketing.
+ *
+ * ```kotlin
+ * // In Application.onCreate() or main Activity.onCreate():
+ * Appfiliate.configure(this, appId = "app_xxx", apiKey = "key_xxx")
+ * Appfiliate.trackInstall(this)
+ * ```
+ */
+object Appfiliate {
 
     private const val TAG = "Appfiliate"
     private const val SDK_VERSION = "1.0.0"
@@ -61,19 +75,23 @@ public object Appfiliate {
     /**
      * Track app install attribution. Call once on first app launch, after configure().
      * Automatically reads the Google Play Install Referrer for deterministic matching.
+     * Safe to call on every launch — only runs once per install.
      *
      * ```kotlin
-     * Appfiliate.trackInstall(this)
+     * Appfiliate.trackInstall(this) { result ->
+     *     Log.d("Appfiliate", "Matched: ${result.matched}")
+     * }
      * ```
      */
     @JvmStatic
-    fun trackInstall(context: Context, callback: ((AttributionResult) -> Unit)? = null) {
+    @JvmOverloads
+    fun trackInstall(context: Context, completion: ((AttributionResult) -> Unit)? = null) {
         if (!isConfigured) {
-            Log.e(TAG, "Call Appfiliate.configure() before trackInstall()")
+            Log.e(TAG, "Error: call Appfiliate.configure() before trackInstall()")
             return
         }
 
-        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        val prefs = context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         if (prefs.getBoolean(KEY_TRACKED, false)) {
             // Already tracked — return cached result
             val cached = AttributionResult(
@@ -83,14 +101,14 @@ public object Appfiliate {
                 method = "cached",
                 clickId = null
             )
-            callback?.invoke(cached)
+            completion?.invoke(cached)
             return
         }
 
-        // Try to read the Install Referrer (deterministic attribution)
+        // Try to read the Install Referrer (deterministic attribution), then send
         readInstallReferrer(context) { referrer ->
             val payload = buildPayload(context, referrer)
-            sendAttribution(context, payload, callback)
+            sendAttribution(context, payload, completion)
         }
     }
 
@@ -105,11 +123,12 @@ public object Appfiliate {
      *     productId = "premium_monthly",
      *     revenue = 9.99,
      *     currency = "USD",
-     *     transactionId = "GPA.1234-5678"
+     *     transactionId = purchase.orderId
      * )
      * ```
      */
     @JvmStatic
+    @JvmOverloads
     fun trackPurchase(
         context: Context,
         productId: String,
@@ -118,24 +137,29 @@ public object Appfiliate {
         transactionId: String? = null
     ) {
         if (!isConfigured) {
-            Log.e(TAG, "Call Appfiliate.configure() before trackPurchase()")
+            Log.e(TAG, "Error: call Appfiliate.configure() before trackPurchase()")
             return
         }
 
-        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        val attributionId = prefs.getString(KEY_ATTRIBUTION_ID, null)
+        val prefs = context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        val attrId = prefs.getString(KEY_ATTRIBUTION_ID, null)
 
-        if (attributionId == null) {
+        if (attrId == null) {
             Log.w(TAG, "No attribution ID found. Install may not have been attributed.")
             return
         }
 
+        val isoFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.US).apply {
+            timeZone = TimeZone.getTimeZone("UTC")
+        }
+
         val payload = JSONObject().apply {
             put("app_id", appId)
-            put("attribution_id", attributionId)
+            put("attribution_id", attrId)
             put("product_id", productId)
             put("revenue", revenue)
             put("currency", currency)
+            put("timestamp", isoFormat.format(Date()))
             put("sdk_version", SDK_VERSION)
             if (transactionId != null) put("transaction_id", transactionId)
         }
@@ -150,23 +174,82 @@ public object Appfiliate {
         }
     }
 
-    // MARK: - Public Helpers
+    // MARK: - User ID
+
+    /**
+     * Link an external user ID (e.g. RevenueCat appUserID) to this install's attribution.
+     * This allows server-side integrations (webhooks) to attribute purchases automatically.
+     *
+     * ```kotlin
+     * Appfiliate.setUserId(this, Purchases.sharedInstance.appUserID)
+     * ```
+     */
+    @JvmStatic
+    fun setUserId(context: Context, userId: String) {
+        if (!isConfigured) {
+            Log.e(TAG, "Error: call Appfiliate.configure() before setUserId()")
+            return
+        }
+
+        val prefs = context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        val attrId = prefs.getString(KEY_ATTRIBUTION_ID, null)
+
+        if (attrId == null) {
+            Log.w(TAG, "No attribution ID found. Call trackInstall() before setUserId().")
+            return
+        }
+
+        val payload = JSONObject().apply {
+            put("app_id", appId)
+            put("attribution_id", attrId)
+            put("user_id", userId)
+            put("sdk_version", SDK_VERSION)
+        }
+
+        executor.execute {
+            val result = post("/v1/user-id", payload)
+            if (result != null) {
+                Log.d(TAG, "User ID linked: $userId")
+            } else {
+                Log.e(TAG, "setUserId failed")
+            }
+        }
+    }
+
+    // MARK: - Public Properties
 
     /**
      * Check if this install was attributed to a creator.
      */
     @JvmStatic
     fun isAttributed(context: Context): Boolean {
-        return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        return context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
             .getBoolean(KEY_MATCHED, false)
     }
 
     /**
-     * The attribution ID for this install (null if not attributed).
+     * The cached attribution ID, read without context.
+     * Only available after trackInstall() has completed successfully.
      */
     @JvmStatic
-    fun getAttributionId(context: Context): String? {
-        return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+    var attributionId: String? = null
+        private set
+
+    /**
+     * Whether this install was attributed, read without context.
+     * Only available after trackInstall() has completed successfully.
+     */
+    @JvmStatic
+    var isAttributed: Boolean = false
+        private set
+
+    /**
+     * The attribution ID for this install (null if not attributed).
+     * Reads from SharedPreferences with the given context.
+     */
+    @JvmStatic
+    fun attributionId(context: Context): String? {
+        return context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
             .getString(KEY_ATTRIBUTION_ID, null)
     }
 
@@ -174,7 +257,7 @@ public object Appfiliate {
 
     private fun readInstallReferrer(context: Context, callback: (String?) -> Unit) {
         try {
-            val client = InstallReferrerClient.newBuilder(context).build()
+            val client = InstallReferrerClient.newBuilder(context.applicationContext).build()
             client.startConnection(object : InstallReferrerStateListener {
                 override fun onInstallReferrerSetupFinished(responseCode: Int) {
                     if (responseCode == InstallReferrerClient.InstallReferrerResponse.OK) {
@@ -213,23 +296,16 @@ public object Appfiliate {
             put("app_id", appId)
             put("platform", "android")
             put("device_model", Build.MODEL)
-            put("device_manufacturer", Build.MANUFACTURER)
             put("os_version", Build.VERSION.RELEASE)
-            put("sdk_int", Build.VERSION.SDK_INT)
             put("screen_width", metrics.widthPixels)
             put("screen_height", metrics.heightPixels)
-            put("screen_density", metrics.density)
             put("timezone", TimeZone.getDefault().id)
-            put("language", Locale.getDefault().language)
-            put("languages", JSONArray(Locale.getDefault().let {
-                listOf(it.toLanguageTag())
-            }))
-            put("hw_concurrency", Runtime.getRuntime().availableProcessors())
+            put("language", Locale.getDefault().toLanguageTag())
             put("sdk_version", SDK_VERSION)
 
             // Install Referrer (deterministic — the key signal for Android)
             if (referrer != null) {
-                put("referrer", referrer)
+                put("install_referrer", referrer)
                 // Extract our click ID if present
                 val clickId = parseReferrerParam(referrer, "af_click_id")
                 if (clickId != null) {
@@ -262,18 +338,23 @@ public object Appfiliate {
                     clickId = json.optString("click_id", null)
                 )
 
-                // Cache result
-                val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                // Cache result in SharedPreferences
+                val prefs = context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
                 prefs.edit()
                     .putBoolean(KEY_TRACKED, true)
                     .putBoolean(KEY_MATCHED, result.matched)
                     .putString(KEY_ATTRIBUTION_ID, result.attributionId)
                     .apply()
 
+                // Update in-memory properties
+                this.isAttributed = result.matched
+                this.attributionId = result.attributionId
+
                 Log.d(TAG, "Install attribution: matched=${result.matched}, confidence=${result.confidence}, method=${result.method}")
                 callback?.invoke(result)
             } else {
                 Log.e(TAG, "Attribution request failed")
+                // Don't mark as tracked so it retries next launch
                 callback?.invoke(
                     AttributionResult(false, null, 0.0, "error", null)
                 )
@@ -293,13 +374,17 @@ public object Appfiliate {
             conn.readTimeout = 10_000
             conn.doOutput = true
 
-            OutputStreamWriter(conn.outputStream).use { it.write(payload.toString()) }
+            OutputStreamWriter(conn.outputStream, Charsets.UTF_8).use {
+                it.write(payload.toString())
+            }
 
-            if (conn.responseCode == 200) {
-                val body = conn.inputStream.bufferedReader().readText()
+            if (conn.responseCode in 200..299) {
+                val body = conn.inputStream.bufferedReader(Charsets.UTF_8).readText()
+                conn.disconnect()
                 JSONObject(body)
             } else {
                 Log.e(TAG, "API error: ${conn.responseCode}")
+                conn.disconnect()
                 null
             }
         } catch (e: Exception) {
@@ -307,14 +392,4 @@ public object Appfiliate {
             null
         }
     }
-
-    // MARK: - Data Classes
-
-    data class AttributionResult(
-        val matched: Boolean,
-        val attributionId: String?,
-        val confidence: Double,
-        val method: String,
-        val clickId: String?
-    )
 }
