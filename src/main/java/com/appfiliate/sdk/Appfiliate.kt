@@ -21,7 +21,7 @@ import java.util.TimeZone
 import java.util.concurrent.Executors
 
 /**
- * Appfiliate — lightweight install attribution for mobile app affiliate marketing.
+ * Appfiliate — install attribution SDK for mobile app affiliate marketing.
  *
  * ```kotlin
  * // In Application.onCreate() or main Activity.onCreate():
@@ -42,6 +42,10 @@ object Appfiliate {
     private var apiKey: String? = null
     private var apiBase = "https://us-central1-appfiliate-5a18b.cloudfunctions.net/api"
     private var isConfigured = false
+    private var pendingUserId: String? = null
+    private var pendingUserIdContext: Context? = null
+    @Volatile
+    private var attributionInFlight = false
 
     private val executor = Executors.newSingleThreadExecutor()
 
@@ -102,8 +106,11 @@ object Appfiliate {
                 clickId = null
             )
             completion?.invoke(cached)
+            flushPendingUserId()
             return
         }
+
+        attributionInFlight = true
 
         // Try to read the Install Referrer (deterministic attribution), then send
         readInstallReferrer(context) { referrer ->
@@ -191,17 +198,30 @@ object Appfiliate {
             return
         }
 
+        // If attribution is still in flight, queue and send when it completes
+        if (attributionInFlight) {
+            pendingUserId = userId
+            pendingUserIdContext = context.applicationContext
+            return
+        }
+
         val prefs = context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         val attrId = prefs.getString(KEY_ATTRIBUTION_ID, null)
 
         if (attrId == null) {
-            Log.w(TAG, "No attribution ID found. Call trackInstall() before setUserId().")
+            // Attribution finished but wasn't matched — queue in case of retry on next launch
+            pendingUserId = userId
+            pendingUserIdContext = context.applicationContext
             return
         }
 
+        sendUserId(context.applicationContext, userId, attrId)
+    }
+
+    private fun sendUserId(context: Context, userId: String, attributionId: String) {
         val payload = JSONObject().apply {
             put("app_id", appId)
-            put("attribution_id", attrId)
+            put("attribution_id", attributionId)
             put("user_id", userId)
             put("sdk_version", SDK_VERSION)
         }
@@ -214,6 +234,17 @@ object Appfiliate {
                 Log.e(TAG, "setUserId failed")
             }
         }
+    }
+
+    private fun flushPendingUserId() {
+        val userId = pendingUserId ?: return
+        val context = pendingUserIdContext ?: return
+        pendingUserId = null
+        pendingUserIdContext = null
+
+        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        val attrId = prefs.getString(KEY_ATTRIBUTION_ID, null) ?: return
+        sendUserId(context, userId, attrId)
     }
 
     // MARK: - Public Properties
@@ -351,9 +382,12 @@ object Appfiliate {
                 this.attributionId = result.attributionId
 
                 Log.d(TAG, "Install attribution: matched=${result.matched}, confidence=${result.confidence}, method=${result.method}")
+                attributionInFlight = false
                 callback?.invoke(result)
+                flushPendingUserId()
             } else {
                 Log.e(TAG, "Attribution request failed")
+                attributionInFlight = false
                 // Don't mark as tracked so it retries next launch
                 callback?.invoke(
                     AttributionResult(false, null, 0.0, "error", null)
